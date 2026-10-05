@@ -365,6 +365,78 @@ pub async fn list_threads_db(
     project_id: Option<Option<&str>>,
     search_term: Option<&str>,
 ) -> Option<codex_state::ThreadsPage> {
+    list_threads_db_inner(
+        context,
+        sqlite,
+        page_size,
+        cursor,
+        sort_key,
+        sort_direction,
+        allowed_sources,
+        model_providers,
+        cwd_filters,
+        relation_filter,
+        archived,
+        section,
+        project_id,
+        search_term,
+        /*include_thread_id_tiebreaker*/ false,
+    )
+    .await
+}
+
+/// List a recovered SQLite page without losing equal-timestamp matches.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn list_threads_db_with_id_tiebreaker(
+    context: Option<&codex_state::StateRuntime>,
+    sqlite: &codex_state::SqliteConfig,
+    page_size: usize,
+    cursor: Option<&Cursor>,
+    sort_key: ThreadSortKey,
+    sort_direction: SortDirection,
+    allowed_sources: &[SessionSource],
+    model_providers: Option<&[String]>,
+    cwd_filters: Option<&[PathBuf]>,
+    archived: bool,
+) -> Option<codex_state::ThreadsPage> {
+    list_threads_db_inner(
+        context,
+        sqlite,
+        page_size,
+        cursor,
+        sort_key,
+        sort_direction,
+        allowed_sources,
+        model_providers,
+        cwd_filters,
+        /*relation_filter*/ None,
+        archived,
+        /*section*/ None,
+        /*project_id*/ None,
+        /*search_term*/ None,
+        /*include_thread_id_tiebreaker*/ true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn list_threads_db_inner(
+    context: Option<&codex_state::StateRuntime>,
+    sqlite: &codex_state::SqliteConfig,
+    page_size: usize,
+    cursor: Option<&Cursor>,
+    sort_key: ThreadSortKey,
+    sort_direction: SortDirection,
+    allowed_sources: &[SessionSource],
+    model_providers: Option<&[String]>,
+    cwd_filters: Option<&[PathBuf]>,
+    relation_filter: Option<codex_state::ThreadRelationFilter>,
+    archived: bool,
+    section: Option<Option<&str>>,
+    project_id: Option<Option<&str>>,
+    search_term: Option<&str>,
+    include_thread_id_tiebreaker: bool,
+) -> Option<codex_state::ThreadsPage> {
     let ctx = context?;
     if ctx.sqlite() != sqlite {
         warn!(
@@ -442,7 +514,13 @@ pub async fn list_threads_db(
             sort_direction: state_sort_direction,
             search_term,
         };
-        let page = match ctx.list_threads(page_size - items.len(), filters).await {
+        let result = if include_thread_id_tiebreaker {
+            ctx.list_threads_with_id_tiebreaker(page_size - items.len(), filters)
+                .await
+        } else {
+            ctx.list_threads(page_size - items.len(), filters).await
+        };
+        let page = match result {
             Ok(page) => page,
             Err(err) => {
                 warn!("state db list_threads failed: {err}");
@@ -542,6 +620,17 @@ pub async fn reconcile_rollout(
         .await;
         return;
     }
+    reconcile_rollout_from_file(context, rollout_path, default_provider, archived_only).await;
+}
+
+/// Return the reconciled thread ID, so callers can safely use repaired rows.
+pub(crate) async fn reconcile_rollout_from_file(
+    context: Option<&codex_state::StateRuntime>,
+    rollout_path: &Path,
+    default_provider: &str,
+    archived_only: Option<bool>,
+) -> Option<ThreadId> {
+    let ctx = context?;
     let outcome =
         match metadata::extract_metadata_from_rollout(rollout_path, default_provider).await {
             Ok(outcome) => outcome,
@@ -550,13 +639,19 @@ pub async fn reconcile_rollout(
                     "state db reconcile_rollout extraction failed {}: {err}",
                     rollout_path.display()
                 );
-                return;
+                return None;
             }
         };
     let mut metadata = outcome.metadata;
     let memory_mode = outcome.memory_mode.unwrap_or_else(|| "enabled".to_string());
     metadata.cwd = normalize_cwd_for_state_db(&metadata.cwd);
-    let existing_metadata = ctx.get_thread(metadata.id).await.ok().flatten();
+    let existing_metadata = match ctx.get_thread(metadata.id).await {
+        Ok(existing) => existing,
+        Err(err) => {
+            warn!("state db reconcile_rollout ownership lookup failed: {err}");
+            return None;
+        }
+    };
     // Filesystem repair may seed a missing row, but it must not change an existing row's
     // selected rollout path. After `thread/revert`, a scan can find multiple immutable
     // rollouts for one thread and cannot know which one SQLite selected.
@@ -564,7 +659,7 @@ pub async fn reconcile_rollout(
         .as_ref()
         .is_some_and(|existing| existing.rollout_path.as_path() != rollout_path)
     {
-        return;
+        return None;
     }
     // Paginated metadata updates are SQLite-only. Use the rollout mode to seed a
     // missing row, then keep the value from SQLite.
@@ -588,7 +683,7 @@ pub async fn reconcile_rollout(
             "state db reconcile_rollout upsert failed {}: {err}",
             rollout_path.display()
         );
-        return;
+        return None;
     }
     if restore_memory_mode_from_rollout
         && let Err(err) = ctx
@@ -600,6 +695,7 @@ pub async fn reconcile_rollout(
             rollout_path.display()
         );
     }
+    Some(metadata.id)
 }
 
 /// Repair a thread's rollout path after filesystem fallback succeeds.

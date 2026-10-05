@@ -143,6 +143,25 @@ fn write_session_file(root: &Path, ts: &str, uuid: Uuid) -> std::io::Result<Path
     Ok(path)
 }
 
+fn delay_session_preview(path: &Path) -> std::io::Result<()> {
+    let jsonl = fs::read_to_string(path)?;
+    let mut lines = jsonl.lines();
+    let meta = lines.next().unwrap();
+    let user_event = lines.next().unwrap();
+    let filler = serde_json::to_string(&RolloutLine {
+        timestamp: "2025-01-03T13:00:00Z".to_string(),
+        ordinal: None,
+        item: agent_message_item("Waiting"),
+    })?;
+    fs::write(
+        path,
+        format!(
+            "{meta}\n{}{user_event}\n",
+            format!("{filler}\n").repeat(220)
+        ),
+    )
+}
+
 #[test]
 fn append_repair_terminates_nonempty_rollout_tail() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
@@ -1523,7 +1542,437 @@ async fn list_threads_state_db_only_skips_jsonl_repair_scan() -> std::io::Result
 }
 
 #[tokio::test]
-async fn list_threads_default_filter_returns_filesystem_scan_results() -> std::io::Result<()> {
+async fn list_threads_metadata_filters_keep_db_matches_without_head_previews() -> std::io::Result<()>
+{
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let uuid = Uuid::from_u128(9016);
+    let path = write_session_file(home.path(), "2025-01-03T13-00-00", uuid)?;
+    let jsonl = fs::read_to_string(&path)?;
+    let mut lines = jsonl.lines();
+    let mut meta: serde_json::Value = serde_json::from_str(lines.next().unwrap())?;
+    meta["payload"]["cwd"] = serde_json::json!(home.path());
+    let user_event = lines.next().unwrap();
+    // Put the preview beyond the filesystem summary's bounded head scan.
+    fs::write(&path, format!("{meta}\n{user_event}\n"))?;
+    delay_session_preview(&path)?;
+
+    let runtime = codex_state::StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(home.path().abs()),
+        config.model_provider_id.clone(),
+    )
+    .await
+    .expect("state db should initialize");
+    runtime
+        .mark_backfill_complete(/*last_watermark*/ None)
+        .await
+        .expect("backfill should be complete");
+    state_db::reconcile_rollout(
+        Some(runtime.as_ref()),
+        &path,
+        config.model_provider_id.as_str(),
+        /*builder*/ None,
+        &[],
+        Some(false),
+        /*new_thread_memory_mode*/ None,
+    )
+    .await;
+    let sources = [SessionSource::Cli];
+    let providers = [config.model_provider_id.clone()];
+    let cwds = [home.path().to_path_buf()];
+    for sort_key in [ThreadSortKey::CreatedAt, ThreadSortKey::UpdatedAt] {
+        for sort_direction in [SortDirection::Asc, SortDirection::Desc] {
+            let db_page = RolloutRecorder::list_threads_from_state_db(
+                Some(runtime.clone()),
+                &config,
+                /*page_size*/ 1,
+                /*cursor*/ None,
+                sort_key,
+                sort_direction,
+                &sources,
+                Some(&providers),
+                Some(&cwds),
+                config.model_provider_id.as_str(),
+                /*search_term*/ None,
+            )
+            .await?;
+            assert_eq!(db_page.items.len(), 1);
+            let page = RolloutRecorder::list_threads(
+                Some(runtime.clone()),
+                &config,
+                /*page_size*/ 1,
+                /*cursor*/ None,
+                sort_key,
+                sort_direction,
+                &sources,
+                Some(&providers),
+                Some(&cwds),
+                config.model_provider_id.as_str(),
+                /*search_term*/ None,
+            )
+            .await?;
+            assert_eq!(page.items.len(), 1, "{sort_key:?} {sort_direction:?}");
+            assert_eq!(page.items[0].path, path);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_threads_metadata_filters_bound_replacement_repairs() -> std::io::Result<()> {
+    for stale_rows in [2usize, 3] {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let runtime = codex_state::StateRuntime::init(
+            config.sqlite.clone(),
+            config.model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        runtime
+            .mark_backfill_complete(/*last_watermark*/ None)
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for i in 0..stale_rows {
+            let uuid = Uuid::from_u128(9100 + i as u128);
+            let id = ThreadId::from_string(&uuid.to_string()).unwrap();
+            let path = write_session_file(home.path(), &format!("2025-01-03T13-{i:02}-00"), uuid)?;
+            state_db::reconcile_rollout(
+                Some(runtime.as_ref()),
+                &path,
+                config.model_provider_id.as_str(),
+                /*builder*/ None,
+                &[],
+                Some(false),
+                /*new_thread_memory_mode*/ None,
+            )
+            .await;
+            let mut metadata = runtime.get_thread(id).await.unwrap().unwrap();
+            metadata.cwd = state_db::normalize_cwd_for_state_db(home.path());
+            runtime.upsert_thread(&metadata).await.unwrap();
+            ids.push(id);
+        }
+        let cwds = [home.path().to_path_buf()];
+        let page = RolloutRecorder::list_threads(
+            Some(runtime.clone()),
+            &config,
+            /*page_size*/ 1,
+            /*cursor*/ None,
+            ThreadSortKey::CreatedAt,
+            SortDirection::Desc,
+            &[SessionSource::Cli],
+            /*model_providers*/ None,
+            Some(&cwds),
+            config.model_provider_id.as_str(),
+            /*search_term*/ None,
+        )
+        .await?;
+        assert!(
+            page.items.is_empty(),
+            "unchecked replacement must not be returned"
+        );
+        // At most two requested pages of DB-only rows are fully read in one request.
+        let mut still_stale = 0;
+        for id in ids {
+            let row = runtime.get_thread(id).await.unwrap().unwrap();
+            still_stale += usize::from(row.cwd == state_db::normalize_cwd_for_state_db(&cwds[0]));
+        }
+        assert_eq!(still_stale, stale_rows.saturating_sub(2));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_threads_metadata_filters_fall_back_after_failed_repair() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let uuid = Uuid::from_u128(9110);
+    let id = ThreadId::from_string(&uuid.to_string()).unwrap();
+    let path = write_session_file(home.path(), "2025-01-03T13-00-00", uuid)?;
+    let runtime =
+        codex_state::StateRuntime::init(config.sqlite.clone(), config.model_provider_id.clone())
+            .await
+            .expect("state db should initialize");
+    runtime
+        .mark_backfill_complete(/*last_watermark*/ None)
+        .await
+        .unwrap();
+    state_db::reconcile_rollout(
+        Some(runtime.as_ref()),
+        &path,
+        config.model_provider_id.as_str(),
+        /*builder*/ None,
+        &[],
+        Some(false),
+        /*new_thread_memory_mode*/ None,
+    )
+    .await;
+    let mut metadata = runtime.get_thread(id).await.unwrap().unwrap();
+    metadata.cwd = state_db::normalize_cwd_for_state_db(home.path());
+    runtime.upsert_thread(&metadata).await.unwrap();
+    let metadata = runtime.get_thread(id).await.unwrap().unwrap();
+    fs::write(&path, "")?;
+    let cwds = [home.path().to_path_buf()];
+    let page = RolloutRecorder::list_threads(
+        Some(runtime.clone()),
+        &config,
+        /*page_size*/ 1,
+        /*cursor*/ None,
+        ThreadSortKey::CreatedAt,
+        SortDirection::Desc,
+        &[SessionSource::Cli],
+        /*model_providers*/ None,
+        Some(&cwds),
+        config.model_provider_id.as_str(),
+        /*search_term*/ None,
+    )
+    .await?;
+    assert!(page.items.is_empty());
+    assert_eq!(runtime.get_thread(id).await.unwrap().unwrap(), metadata);
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_threads_db_cursor_keeps_updated_order_without_duplicates() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let runtime =
+        codex_state::StateRuntime::init(config.sqlite.clone(), config.model_provider_id.clone())
+            .await
+            .expect("state db should initialize");
+    runtime
+        .mark_backfill_complete(/*last_watermark*/ None)
+        .await
+        .expect("backfill complete");
+    let mut ids = Vec::new();
+    for i in 0..4u64 {
+        let uuid = Uuid::from_u128(9100 + i as u128);
+        let id = ThreadId::from_string(&uuid.to_string()).unwrap();
+        ids.push(id);
+        let created = chrono::DateTime::from_timestamp(1_735_905_600 + i as i64 * 60, 0).unwrap();
+        let path = write_session_file(
+            home.path(),
+            &created.format("%Y-%m-%dT%H-%M-%S").to_string(),
+            uuid,
+        )?;
+        File::options().write(true).open(&path)?.set_times(
+            std::fs::FileTimes::new().set_modified(
+                std::time::UNIX_EPOCH + Duration::from_secs(created.timestamp() as u64),
+            ),
+        )?;
+        let mut builder =
+            codex_state::ThreadMetadataBuilder::new(id, path, created, SessionSource::Cli);
+        builder.cwd = state_db::normalize_cwd_for_state_db(Path::new("."));
+        builder.model_provider = Some(config.model_provider_id.clone());
+        if i == 0 {
+            // A promoted thread has recent SQLite-owned metadata but an old rollout mtime.
+            builder.history_mode = ThreadHistoryMode::Paginated;
+            builder.updated_at = Some(chrono::DateTime::from_timestamp(1_735_905_840, 0).unwrap());
+        }
+        let mut metadata = builder.build(&config.model_provider_id);
+        metadata.first_user_message = Some("Hello from user".to_string());
+        metadata.preview = metadata.first_user_message.clone();
+        runtime.upsert_thread(&metadata).await.expect("seed thread");
+    }
+    let mut cursor = None;
+    let mut found = Vec::new();
+    for _ in 0..6 {
+        let page = RolloutRecorder::list_threads(
+            Some(runtime.clone()),
+            &config,
+            /*page_size*/ 1,
+            cursor.as_ref(),
+            ThreadSortKey::UpdatedAt,
+            SortDirection::Desc,
+            &[SessionSource::Cli],
+            /*model_providers*/ None,
+            /*cwd_filters*/ None,
+            &config.model_provider_id,
+            /*search_term*/ None,
+        )
+        .await?;
+        assert!(page.items.len() <= 1);
+        found.extend(page.items.into_iter().map(|item| item.thread_id.unwrap()));
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert!(cursor.is_none(), "pagination did not terminate");
+    assert_eq!(found, vec![ids[0], ids[3], ids[2], ids[1]]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_threads_recovered_pages_preserve_timestamp_ties() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let runtime =
+        codex_state::StateRuntime::init(config.sqlite.clone(), config.model_provider_id.clone())
+            .await
+            .expect("state db should initialize");
+    runtime
+        .mark_backfill_complete(/*last_watermark*/ None)
+        .await
+        .expect("backfill complete");
+    // Advance the hot-write clock so historical repairs preserve identical file mtimes.
+    runtime
+        .touch_thread_updated_at(ThreadId::new(), chrono::Utc::now())
+        .await
+        .expect("advance timestamp allocator");
+    let mut ids = Vec::new();
+    let timestamp = chrono::Utc.with_ymd_and_hms(2025, 1, 3, 13, 0, 0).unwrap();
+    for i in 0..3u128 {
+        let uuid = Uuid::from_u128(9200 + i);
+        let id = ThreadId::from_string(&uuid.to_string()).unwrap();
+        ids.push(id);
+        let path = write_session_file(home.path(), "2025-01-03T13-00-00", uuid)?;
+        delay_session_preview(&path)?;
+        File::options().write(true).open(&path)?.set_times(
+            std::fs::FileTimes::new().set_modified(
+                std::time::UNIX_EPOCH + Duration::from_secs(timestamp.timestamp() as u64),
+            ),
+        )?;
+        state_db::reconcile_rollout(
+            Some(runtime.as_ref()),
+            &path,
+            &config.model_provider_id,
+            /*builder*/ None,
+            &[],
+            Some(false),
+            /*new_thread_memory_mode*/ None,
+        )
+        .await;
+    }
+    for sort_key in [ThreadSortKey::CreatedAt, ThreadSortKey::UpdatedAt] {
+        for sort_direction in [SortDirection::Asc, SortDirection::Desc] {
+            let mut cursor = None;
+            let mut found = Vec::new();
+            for _ in 0..4 {
+                let page = RolloutRecorder::list_threads(
+                    Some(runtime.clone()),
+                    &config,
+                    /*page_size*/ 1,
+                    cursor.as_ref(),
+                    sort_key,
+                    sort_direction,
+                    &[SessionSource::Cli],
+                    /*model_providers*/ None,
+                    /*cwd_filters*/ None,
+                    &config.model_provider_id,
+                    /*search_term*/ None,
+                )
+                .await?;
+                assert_eq!(page.items.len(), 1, "{sort_key:?} {sort_direction:?}");
+                found.extend(page.items.into_iter().map(|item| item.thread_id.unwrap()));
+                cursor = page.next_cursor;
+                if cursor.is_none() {
+                    break;
+                }
+                assert!(cursor.as_ref().unwrap().thread_id().is_some());
+            }
+            let mut expected = ids.clone();
+            if sort_direction == SortDirection::Desc {
+                expected.reverse();
+            }
+            assert_eq!(found, expected, "{sort_key:?} {sort_direction:?}");
+            assert!(cursor.is_none(), "pagination did not terminate");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_threads_recovered_cursor_preserves_ties_after_failed_repair() -> std::io::Result<()> {
+    for sort_key in [ThreadSortKey::CreatedAt, ThreadSortKey::UpdatedAt] {
+        for sort_direction in [SortDirection::Asc, SortDirection::Desc] {
+            let home = TempDir::new().expect("temp dir");
+            let config = test_config(home.path());
+            let runtime = codex_state::StateRuntime::init(
+                config.sqlite.clone(),
+                config.model_provider_id.clone(),
+            )
+            .await
+            .expect("state db should initialize");
+            runtime
+                .mark_backfill_complete(/*last_watermark*/ None)
+                .await
+                .expect("backfill complete");
+            // Advance the hot-write clock so historical repairs preserve identical file mtimes.
+            runtime
+                .touch_thread_updated_at(ThreadId::new(), chrono::Utc::now())
+                .await
+                .expect("advance timestamp allocator");
+            let timestamp = chrono::Utc.with_ymd_and_hms(2025, 1, 3, 13, 0, 0).unwrap();
+            let mut ids = Vec::new();
+            let mut paths = Vec::new();
+            for i in 0..5u128 {
+                let uuid = Uuid::from_u128(9300 + i);
+                ids.push(ThreadId::from_string(&uuid.to_string()).unwrap());
+                let path = write_session_file(home.path(), "2025-01-03T13-00-00", uuid)?;
+                File::options().write(true).open(&path)?.set_times(
+                    std::fs::FileTimes::new().set_modified(
+                        std::time::UNIX_EPOCH + Duration::from_secs(timestamp.timestamp() as u64),
+                    ),
+                )?;
+                state_db::reconcile_rollout(
+                    Some(runtime.as_ref()),
+                    &path,
+                    &config.model_provider_id,
+                    /*builder*/ None,
+                    &[],
+                    Some(false),
+                    /*new_thread_memory_mode*/ None,
+                )
+                .await;
+                paths.push(path);
+            }
+            let (anchor_index, failed_index, expected) = match sort_direction {
+                SortDirection::Asc => (0, 1, vec![ids[2], ids[3], ids[4]]),
+                SortDirection::Desc => (4, 3, vec![ids[2], ids[1], ids[0]]),
+            };
+            // The first DB-only candidate cannot be reconciled, forcing filesystem fallback.
+            fs::write(&paths[failed_index], "")?;
+            let before = runtime.get_thread(ids[failed_index]).await.unwrap();
+            let mut cursor = Some(Cursor::with_thread_id(
+                OffsetDateTime::parse("2025-01-03T13:00:00Z", &Rfc3339).unwrap(),
+                ids[anchor_index],
+            ));
+            let mut found = Vec::new();
+            for _ in 0..4 {
+                let page = RolloutRecorder::list_threads(
+                    Some(runtime.clone()),
+                    &config,
+                    /*page_size*/ 1,
+                    cursor.as_ref(),
+                    sort_key,
+                    sort_direction,
+                    &[SessionSource::Cli],
+                    /*model_providers*/ None,
+                    /*cwd_filters*/ None,
+                    &config.model_provider_id,
+                    /*search_term*/ None,
+                )
+                .await?;
+                assert_eq!(page.items.len(), 1, "{sort_key:?} {sort_direction:?}");
+                found.extend(page.items.into_iter().map(|item| item.thread_id.unwrap()));
+                cursor = page.next_cursor;
+                if cursor.is_none() {
+                    break;
+                }
+                assert!(cursor.as_ref().unwrap().thread_id().is_some());
+            }
+            assert_eq!(found, expected, "{sort_key:?} {sort_direction:?}");
+            assert!(cursor.is_none(), "pagination did not terminate");
+            assert_eq!(runtime.get_thread(ids[failed_index]).await.unwrap(), before);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_threads_filters_preserve_metadata_authority() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let config = test_config(home.path());
 
@@ -1548,7 +1997,7 @@ async fn list_threads_default_filter_returns_filesystem_scan_results() -> std::i
         .expect("valid datetime");
     let mut builder = codex_state::ThreadMetadataBuilder::new(
         thread_id,
-        real_path,
+        real_path.clone(),
         created_at,
         SessionSource::Cli,
     );
@@ -1561,6 +2010,69 @@ async fn list_threads_default_filter_returns_filesystem_scan_results() -> std::i
         .upsert_thread(&metadata)
         .await
         .expect("state db upsert should succeed");
+
+    // A DB-only match activates the exceptional repair path alongside the filesystem hit.
+    let db_only_path =
+        write_session_file(home.path(), "2025-01-03T12-00-00", Uuid::from_u128(9017))?;
+    delay_session_preview(&db_only_path)?;
+    state_db::reconcile_rollout(
+        Some(runtime.as_ref()),
+        &db_only_path,
+        config.model_provider_id.as_str(),
+        /*builder*/ None,
+        &[],
+        Some(false),
+        /*new_thread_memory_mode*/ None,
+    )
+    .await;
+
+    // Filesystem hits must repair DB rows excluded by stale cwd, source, or provider metadata.
+    let actual_cwd = [PathBuf::from(".")];
+    let providers = [config.model_provider_id.clone()];
+    for (source, provider, cwd) in [
+        ("cli", config.model_provider_id.as_str(), stale_cwd.clone()),
+        (
+            "exec",
+            config.model_provider_id.as_str(),
+            actual_cwd[0].clone(),
+        ),
+        ("cli", "stale-provider", actual_cwd[0].clone()),
+    ] {
+        let mut stale = metadata.clone();
+        stale.source = source.to_string();
+        stale.model_provider = provider.to_string();
+        stale.cwd = state_db::normalize_cwd_for_state_db(&cwd);
+        runtime
+            .upsert_thread(&stale)
+            .await
+            .expect("seed stale filter metadata");
+        let repaired_page = RolloutRecorder::list_threads(
+            Some(runtime.clone()),
+            &config,
+            /*page_size*/ 10,
+            /*cursor*/ None,
+            ThreadSortKey::CreatedAt,
+            SortDirection::Desc,
+            &[SessionSource::Cli],
+            /*model_providers*/ Some(providers.as_slice()),
+            /*cwd_filters*/ Some(actual_cwd.as_slice()),
+            config.model_provider_id.as_str(),
+            /*search_term*/ None,
+        )
+        .await?;
+        assert_eq!(repaired_page.items.len(), 2);
+        let repaired = runtime.get_thread(thread_id).await.unwrap().unwrap();
+        assert_eq!(
+            repaired.cwd,
+            state_db::normalize_cwd_for_state_db(&actual_cwd[0])
+        );
+        assert_eq!(repaired.source, "cli");
+        assert_eq!(repaired.model_provider, config.model_provider_id);
+    }
+    runtime
+        .upsert_thread(&metadata)
+        .await
+        .expect("restore stale metadata for the opposite filter");
 
     let cwd_filters = [stale_cwd];
     let state_db_only_page = RolloutRecorder::list_threads_from_state_db(
@@ -1610,6 +2122,56 @@ async fn list_threads_default_filter_returns_filesystem_scan_results() -> std::i
     )
     .await?;
     assert_eq!(repaired_state_db_only_page.items.len(), 0);
+
+    // Existing paginated cwd/provider settings belong to SQLite, not the old rollout head.
+    let jsonl = fs::read_to_string(&real_path)?;
+    let mut lines = jsonl.lines();
+    let mut meta: serde_json::Value = serde_json::from_str(lines.next().unwrap())?;
+    meta["payload"]["history_mode"] = serde_json::json!("paginated");
+    fs::write(&real_path, format!("{meta}\n{}\n", lines.next().unwrap()))?;
+    metadata.history_mode = ThreadHistoryMode::Paginated;
+    metadata.cwd = home.path().join("current-cwd");
+    metadata.model_provider = "current-provider".to_string();
+    runtime.upsert_thread(&metadata).await.unwrap();
+    let current_cwd = [metadata.cwd.clone()];
+    let current_provider = [metadata.model_provider.clone()];
+    for (providers, cwds, expected_match) in [
+        (None, None, true),
+        (
+            Some(current_provider.as_slice()),
+            Some(current_cwd.as_slice()),
+            true,
+        ),
+        (
+            Some(providers.as_slice()),
+            Some(actual_cwd.as_slice()),
+            false,
+        ),
+    ] {
+        let page = RolloutRecorder::list_threads(
+            Some(runtime.clone()),
+            &config,
+            /*page_size*/ 10,
+            /*cursor*/ None,
+            ThreadSortKey::CreatedAt,
+            SortDirection::Desc,
+            &[SessionSource::Cli],
+            /*model_providers*/ providers,
+            /*cwd_filters*/ cwds,
+            config.model_provider_id.as_str(),
+            /*search_term*/ None,
+        )
+        .await?;
+        assert_eq!(
+            page.items
+                .iter()
+                .any(|item| item.thread_id == Some(thread_id)),
+            expected_match
+        );
+        let stored = runtime.get_thread(thread_id).await.unwrap().unwrap();
+        assert_eq!(stored.cwd, metadata.cwd);
+        assert_eq!(stored.model_provider, metadata.model_provider);
+    }
     Ok(())
 }
 

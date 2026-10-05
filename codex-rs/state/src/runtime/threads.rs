@@ -478,8 +478,24 @@ ON CONFLICT(child_thread_id) DO NOTHING
         page_size: usize,
         filters: ThreadFilterOptions<'_>,
     ) -> anyhow::Result<crate::ThreadsPage> {
-        self.list_threads_matching(page_size, filters, /*relation_filter*/ None)
-            .await
+        self.list_threads_matching(
+            page_size, filters, /*relation_filter*/ None,
+            /*include_thread_id_tiebreaker*/ false,
+        )
+        .await
+    }
+
+    /// List threads with stable ordering across equal timestamps.
+    pub async fn list_threads_with_id_tiebreaker(
+        &self,
+        page_size: usize,
+        filters: ThreadFilterOptions<'_>,
+    ) -> anyhow::Result<crate::ThreadsPage> {
+        self.list_threads_matching(
+            page_size, filters, /*relation_filter*/ None,
+            /*include_thread_id_tiebreaker*/ true,
+        )
+        .await
     }
 
     /// List direct children of `parent_thread_id` using persisted spawn edges.
@@ -504,8 +520,13 @@ ON CONFLICT(child_thread_id) DO NOTHING
         relation_filter: crate::ThreadRelationFilter,
         filters: ThreadFilterOptions<'_>,
     ) -> anyhow::Result<crate::ThreadsPage> {
-        self.list_threads_matching(page_size, filters, Some(relation_filter))
-            .await
+        self.list_threads_matching(
+            page_size,
+            filters,
+            Some(relation_filter),
+            /*include_thread_id_tiebreaker*/ true,
+        )
+        .await
     }
 
     async fn list_threads_matching(
@@ -513,11 +534,18 @@ ON CONFLICT(child_thread_id) DO NOTHING
         page_size: usize,
         filters: ThreadFilterOptions<'_>,
         relation_filter: Option<crate::ThreadRelationFilter>,
+        include_thread_id_tiebreaker: bool,
     ) -> anyhow::Result<crate::ThreadsPage> {
         let limit = page_size.saturating_add(1);
 
         let mut builder = QueryBuilder::<Sqlite>::new("");
-        push_list_threads_query(&mut builder, filters, relation_filter, limit);
+        push_list_threads_query(
+            &mut builder,
+            filters,
+            relation_filter,
+            include_thread_id_tiebreaker,
+            limit,
+        );
 
         let rows = builder.build().fetch_all(self.pool.as_ref()).await?;
         let mut items = Vec::with_capacity(rows.len());
@@ -538,7 +566,7 @@ ON CONFLICT(child_thread_id) DO NOTHING
                 parent_thread_ids.remove(&overflow_item.id);
             }
             items.last().and_then(|item| {
-                anchor_from_item(item, filters.sort_key, relation_filter.is_some())
+                anchor_from_item(item, filters.sort_key, include_thread_id_tiebreaker)
             })
         } else {
             None
@@ -1230,6 +1258,7 @@ fn push_list_threads_query(
     builder: &mut QueryBuilder<Sqlite>,
     filters: ThreadFilterOptions<'_>,
     relation_filter: Option<crate::ThreadRelationFilter>,
+    include_thread_id_tiebreaker: bool,
     limit: usize,
 ) {
     if let Some(crate::ThreadRelationFilter::DescendantsOf(ancestor_thread_id)) = relation_filter {
@@ -1264,7 +1293,8 @@ WITH RECURSIVE subtree(child_thread_id, parent_thread_id) AS (
         ),
         None => builder.push(" FROM threads"),
     };
-    let include_thread_id_tiebreaker = relation_filter.is_some()
+    let include_thread_id_tiebreaker = include_thread_id_tiebreaker
+        || relation_filter.is_some()
         || matches!(
             filters.sort_key,
             SortKey::RecencyAt | SortKey::SectionPosition
@@ -1867,6 +1897,7 @@ mod tests {
             &mut builder,
             filters(None, Some(Some(crate::PINNED_THREAD_SECTION_ID))),
             /*relation_filter*/ None,
+            /*include_thread_id_tiebreaker*/ false,
             /*limit*/ 2,
         );
         let plan_details = builder
@@ -1971,6 +2002,7 @@ mod tests {
             &mut builder,
             filters(/*anchor*/ None),
             /*relation_filter*/ None,
+            /*include_thread_id_tiebreaker*/ false,
             /*limit*/ 2,
         );
         let plan_details = builder
@@ -2405,6 +2437,7 @@ mod tests {
                         search_term: None,
                     },
                     /*relation_filter*/ None,
+                    /*include_thread_id_tiebreaker*/ false,
                     /*limit*/ 201,
                 );
                 let plan_details = builder
@@ -2469,6 +2502,7 @@ mod tests {
                             search_term: None,
                         },
                         /*relation_filter*/ None,
+                        /*include_thread_id_tiebreaker*/ false,
                         /*limit*/ 2,
                     );
                     let details = builder
@@ -2566,6 +2600,7 @@ mod tests {
                 search_term: None,
             },
             Some(crate::ThreadRelationFilter::DescendantsOf(parent_id)),
+            /*include_thread_id_tiebreaker*/ true,
             /*limit*/ 10,
         );
         let plan_details = builder
