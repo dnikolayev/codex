@@ -202,6 +202,7 @@ impl Cursor {
 /// pagination.
 struct AnchorState {
     ts: OffsetDateTime,
+    id: Option<Uuid>,
     passed: bool,
 }
 
@@ -210,20 +211,24 @@ impl AnchorState {
         match anchor {
             Some(cursor) => Self {
                 ts: cursor.ts,
+                id: cursor
+                    .id
+                    .and_then(|id| Uuid::parse_str(&id.to_string()).ok()),
                 passed: false,
             },
             None => Self {
                 ts: OffsetDateTime::UNIX_EPOCH,
+                id: None,
                 passed: true,
             },
         }
     }
 
-    fn should_skip(&mut self, ts: OffsetDateTime, _id: Uuid) -> bool {
+    fn should_skip(&mut self, ts: OffsetDateTime, id: Uuid) -> bool {
         if self.passed {
             return false;
         }
-        if ts < self.ts {
+        if ts < self.ts || (ts == self.ts && self.id.is_some_and(|anchor_id| id < anchor_id)) {
             self.passed = true;
             false
         } else {

@@ -563,8 +563,7 @@ impl RolloutRecorder {
             || cwd_filters.is_some()
             || search_term.is_some();
         // Filesystem-first listing intentionally overfetches so we can repair stale/missing
-        // SQLite rows before returning the scan page for filtered listings or the DB page for
-        // unfiltered listings.
+        // SQLite rows before returning the scan page or a reconciled DB page.
         let fs_page = match sort_direction {
             SortDirection::Asc => {
                 list_threads_from_files_asc(
@@ -611,11 +610,12 @@ impl RolloutRecorder {
                 sort_direction,
                 page_size,
                 sort_key,
+                cursor,
             ));
         }
 
-        // For metadata-filtered listings the filesystem page is the page we return. Track those
-        // IDs so the later DB page only triggers full reconciliation for DB-only hits.
+        // Track filesystem hits so the later DB page only triggers full reconciliation for
+        // DB-only hits.
         let fs_page_thread_ids = fs_page
             .items
             .iter()
@@ -702,53 +702,155 @@ impl RolloutRecorder {
                 return Ok(db_page.into());
             }
             if listing_has_metadata_filters {
-                for item in &db_page.items {
-                    // Rows that also appeared in the filesystem page were just validated from the
-                    // rollout head. Rows only found by SQLite may be stale filter matches, so fully
-                    // reconcile those before returning the filesystem-backed page.
-                    if fs_page_thread_ids.contains(&item.id) {
-                        continue;
+                // Repaired DB pages mark their cursors with an ID, preserving their ordering
+                // on later pages without changing the ordinary filesystem-backed path.
+                let use_db_page = search_term.is_none()
+                    && (db_page
+                        .items
+                        .iter()
+                        .any(|item| !fs_page_thread_ids.contains(&item.id))
+                        || (sort_key != ThreadSortKey::RecencyAt
+                            && cursor.is_some_and(|cursor| cursor.thread_id().is_some())));
+                if use_db_page || sort_key == ThreadSortKey::RecencyAt {
+                    'db_repair: {
+                        let mut requery = true;
+                        if use_db_page {
+                            // Repair filesystem hits excluded from SQLite by stale Legacy filters.
+                            for item in &fs_page.items {
+                                let (Some(ctx), Some(thread_id)) =
+                                    (state_db_ctx.as_deref(), item.thread_id)
+                                else {
+                                    continue;
+                                };
+                                let Ok(Some(metadata)) = ctx.get_thread(thread_id).await else {
+                                    break 'db_repair;
+                                };
+                                if matches!(metadata.history_mode, ThreadHistoryMode::Paginated) {
+                                    continue;
+                                }
+                                let stored = thread_item_from_state_metadata(
+                                    metadata, /*parent_thread_id*/ None,
+                                );
+                                let stale = (!allowed_sources.is_empty()
+                                    && stored
+                                        .source
+                                        .as_ref()
+                                        .is_none_or(|source| !allowed_sources.contains(source)))
+                                    || model_providers.is_some_and(|providers| {
+                                        !providers.is_empty()
+                                            && stored.model_provider.as_ref().is_none_or(
+                                                |provider| !providers.contains(provider),
+                                            )
+                                    })
+                                    || cwd_filters.is_some_and(|cwds| {
+                                        !stored.cwd.as_ref().is_some_and(|cwd| {
+                                            cwds.iter().any(|filter| {
+                                                path_utils::paths_match_after_normalization(
+                                                    cwd, filter,
+                                                )
+                                            })
+                                        })
+                                    })
+                                    || (!archived
+                                        && stored.preview.as_deref().is_none_or(str::is_empty));
+                                if stale
+                                    && state_db::reconcile_rollout_from_file(
+                                        state_db_ctx.as_deref(),
+                                        item.path.as_path(),
+                                        default_provider,
+                                        Some(archived),
+                                    )
+                                    .await
+                                        != Some(thread_id)
+                                {
+                                    break 'db_repair;
+                                }
+                            }
+                        }
+                        let mut candidate_page = db_page;
+                        let mut repaired_ids = HashSet::new();
+                        // Repair can expose more stale matches. Bound DB-only full reads to two
+                        // requested pages and fall back if replacement validation cannot finish.
+                        let mut remaining_repairs = page_size.saturating_mul(2);
+                        loop {
+                            if requery {
+                                let repaired_db_page = if use_db_page {
+                                    state_db::list_threads_db_with_id_tiebreaker(
+                                        state_db_ctx.as_deref(),
+                                        sqlite,
+                                        page_size,
+                                        cursor,
+                                        sort_key,
+                                        sort_direction,
+                                        allowed_sources,
+                                        model_providers,
+                                        cwd_filters,
+                                        archived,
+                                    )
+                                    .await
+                                } else {
+                                    state_db::list_threads_db(
+                                        state_db_ctx.as_deref(),
+                                        sqlite,
+                                        page_size,
+                                        cursor,
+                                        sort_key,
+                                        sort_direction,
+                                        allowed_sources,
+                                        model_providers,
+                                        cwd_filters,
+                                        /*relation_filter*/ None,
+                                        archived,
+                                        /*section*/ None,
+                                        /*project_id*/ None,
+                                        search_term,
+                                    )
+                                    .await
+                                };
+                                let Some(repaired_db_page) = repaired_db_page else {
+                                    break 'db_repair;
+                                };
+                                candidate_page = repaired_db_page;
+                                requery = false;
+                            }
+                            if use_db_page {
+                                for item in &candidate_page.items {
+                                    if fs_page_thread_ids.contains(&item.id)
+                                        || matches!(item.history_mode, ThreadHistoryMode::Paginated)
+                                        || repaired_ids.contains(&item.id)
+                                    {
+                                        continue;
+                                    }
+                                    if remaining_repairs == 0
+                                        || state_db::reconcile_rollout_from_file(
+                                            state_db_ctx.as_deref(),
+                                            item.rollout_path.as_path(),
+                                            default_provider,
+                                            Some(archived),
+                                        )
+                                        .await
+                                            != Some(item.id)
+                                    {
+                                        break 'db_repair;
+                                    }
+                                    remaining_repairs -= 1;
+                                    repaired_ids.insert(item.id);
+                                    requery = true;
+                                }
+                            }
+                            if !requery {
+                                return Ok(candidate_page.into());
+                            }
+                        }
                     }
-                    state_db::reconcile_rollout(
-                        state_db_ctx.as_deref(),
-                        item.rollout_path.as_path(),
-                        default_provider,
-                        /*builder*/ None,
-                        &[],
-                        Some(archived),
-                        /*new_thread_memory_mode*/ None,
-                    )
-                    .await;
-                }
-                if sort_key == ThreadSortKey::RecencyAt {
-                    if let Some(repaired_db_page) = state_db::list_threads_db(
-                        state_db_ctx.as_deref(),
-                        sqlite,
-                        page_size,
-                        cursor,
-                        sort_key,
-                        sort_direction,
-                        allowed_sources,
-                        model_providers,
-                        cwd_filters,
-                        /*relation_filter*/ None,
-                        archived,
-                        /*section*/ None,
-                        /*project_id*/ None,
-                        search_term,
-                    )
-                    .await
-                    {
-                        return Ok(repaired_db_page.into());
-                    }
-                    return Ok(db_page.into());
                 }
                 codex_state::record_fallback(
                     "list_threads",
                     "metadata_filter",
                     /*telemetry_override*/ None,
                 );
-                let page = page_from_filesystem_scan(fs_page, sort_direction, page_size, sort_key);
+                let page =
+                    page_from_filesystem_scan(fs_page, sort_direction, page_size, sort_key, cursor);
                 return Ok(fill_missing_thread_item_metadata_from_state_db(
                     state_db_ctx.as_deref(),
                     page,
@@ -758,7 +860,8 @@ impl RolloutRecorder {
             return Ok(db_page.into());
         }
         if listing_has_metadata_filters {
-            let page = page_from_filesystem_scan(fs_page, sort_direction, page_size, sort_key);
+            let page =
+                page_from_filesystem_scan(fs_page, sort_direction, page_size, sort_key, cursor);
             codex_state::record_fallback(
                 "list_threads",
                 "db_error",
@@ -779,6 +882,7 @@ impl RolloutRecorder {
             sort_direction,
             page_size,
             sort_key,
+            cursor,
         ))
     }
 
@@ -1330,11 +1434,19 @@ fn page_from_filesystem_scan(
     sort_direction: SortDirection,
     page_size: usize,
     sort_key: ThreadSortKey,
+    cursor: Option<&Cursor>,
 ) -> ThreadsPage {
-    match sort_direction {
+    let mut page = match sort_direction {
         SortDirection::Asc => page,
         SortDirection::Desc => truncate_fs_page(page, page_size, sort_key),
+    };
+    if cursor.is_some_and(|cursor| cursor.thread_id().is_some())
+        && let Some(next_cursor) = page.next_cursor.as_ref()
+        && let Some(thread_id) = page.items.last().and_then(|item| item.thread_id)
+    {
+        page.next_cursor = Some(Cursor::with_thread_id(next_cursor.timestamp(), thread_id));
     }
+    page
 }
 
 async fn fill_missing_thread_item_metadata_from_state_db(
@@ -1634,9 +1746,7 @@ async fn list_threads_from_files_asc(
         );
         all_items.retain(|item| {
             thread_item_sort_key(item, sort_key).is_some_and(|key| match anchor.1 {
-                Some(anchor_id) if sort_key == ThreadSortKey::RecencyAt => {
-                    key > (anchor.0, anchor_id)
-                }
+                Some(anchor_id) => key > (anchor.0, anchor_id),
                 _ => key.0 > anchor.0,
             })
         });
